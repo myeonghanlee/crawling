@@ -1,4 +1,4 @@
-"""Read-only crawler for Edunet Superintendent-Approved Subjects."""
+"""Read-only crawler for the single ‘교과(군)’ field in Edunet subject details."""
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,24 +9,14 @@ import math
 import re
 import threading
 import time
-from typing import Callable, Any
+from typing import Any, Callable
 
 import requests
 
 API_ROOT = "https://api.edunet.net/main/sprApprSbjct"
 LIST_URL = f"{API_ROOT}/getSprApprSbjctList"
 DETAIL_URL = f"{API_ROOT}/getViewSprApprSbjct"
-COMMON_CODE_URL = f"{API_ROOT}/getSprApprSbjctCommonCodeList"
-
-FIELDS = [
-    ("과목명", "pstTtl"),
-    ("관련교과(교과군)", "relSbj"),
-    ("학교급", "pstSchlLvlCd"),
-    ("소속(기관)", "pstSchlTypeCd"),
-    ("교과서명", "pstTxbNm"),
-    ("상태", "aprvYnCd"),
-    ("작성일", "regDt"),
-]
+OUTPUT_COLUMNS = ("과목명", "관련교과(교과군)")
 
 
 class EdunetApiError(RuntimeError):
@@ -62,18 +52,11 @@ class CrawlSummary:
     selected_last_page: int
 
 
-def _new_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"Accept": "application/json", "User-Agent": "EdunetApprovedSubjectsStreamlit/1.0"})
-    return session
-
-
 def _json_request(
     method: str,
     url: str,
     *,
     params: dict[str, Any] | None = None,
-    json_body: Any = None,
     limiter: RateLimiter,
     timeout: tuple[float, float] = (10, 40),
     attempts: int = 4,
@@ -86,8 +69,7 @@ def _json_request(
                 method,
                 url,
                 params=params,
-                json=json_body,
-                headers={"Accept": "application/json", "User-Agent": "EdunetApprovedSubjectsStreamlit/1.0"},
+                headers={"Accept": "application/json", "User-Agent": "EdunetCourseGroupStreamlit/1.0"},
                 timeout=timeout,
             )
             if response.status_code == 429 or response.status_code >= 500:
@@ -117,22 +99,6 @@ def _json_request(
     raise EdunetApiError(str(last_error or "요청에 실패했습니다."))
 
 
-def fetch_code_maps(limiter: RateLimiter | None = None) -> dict[str, dict[str, str]]:
-    """Fetch current Korean labels for curriculum, institution, school level, and status codes."""
-    limiter = limiter or RateLimiter(0.0)
-    payload = _json_request(
-        "POST",
-        COMMON_CODE_URL,
-        json_body=["CRCLM_CD", "LOC_CD", "SLV_CD", "APRV_CD"],
-        limiter=limiter,
-    )
-    data = payload.get("data") or {}
-    return {
-        group: {str(item.get("comCd")): str(item.get("cdNm") or "") for item in data.get(group, [])}
-        for group in ("CRCLM_CD", "LOC_CD", "SLV_CD", "APRV_CD")
-    }
-
-
 def _list_page(page: int, page_size: int, total_items: int, limiter: RateLimiter) -> dict[str, Any]:
     params = {
         "currentPage": page,
@@ -154,26 +120,36 @@ def _list_page(page: int, page_size: int, total_items: int, limiter: RateLimiter
     }
     payload = _json_request("GET", LIST_URL, params=params, limiter=limiter)
     data = payload.get("data") or {}
-    if not isinstance(data.get("dataList"), list):
+    raw_items = data.get("dataList")
+    if not isinstance(raw_items, list):
         raise EdunetApiError("목록 API 응답에 dataList가 없습니다.")
-    return data
+
+    # Keep only the subject name (row key) and post ID needed to open its detail.
+    minimal_items = [
+        {"pstId": item.get("pstId"), "pstTtl": item.get("pstTtl")}
+        for item in raw_items
+        if isinstance(item, dict)
+    ]
+    return {"pagingProperty": data.get("pagingProperty") or {}, "dataList": minimal_items}
 
 
 def get_2022_stats(page_size: int = 100) -> dict[str, int]:
-    """Return the current record count and page counts using one read-only list request."""
+    """Return the current 2022 record count and page counts using one list request."""
     page_size = max(1, min(int(page_size), 100))
     data = _list_page(1, page_size, 0, RateLimiter(0.0))
     paging = data.get("pagingProperty") or {}
     total_items = int(paging.get("countItem") or 0)
+    api_pages = int(paging.get("countPage") or (math.ceil(total_items / page_size) if total_items else 0))
     return {
         "total_items": total_items,
-        "api_pages": int(paging.get("countPage") or math.ceil(total_items / page_size) if total_items else 0),
+        "api_pages": api_pages,
         "site_pages_at_15": math.ceil(total_items / 15) if total_items else 0,
         "page_size": page_size,
     }
 
 
-def _detail(pst_id: Any, limiter: RateLimiter) -> dict[str, Any]:
+def _detail_body(pst_id: Any, limiter: RateLimiter) -> str:
+    """Fetch the detail body and discard every detail field except pstCn."""
     payload = _json_request(
         "GET",
         DETAIL_URL,
@@ -185,36 +161,47 @@ def _detail(pst_id: Any, limiter: RateLimiter) -> dict[str, Any]:
         data = data["data"]
     if not isinstance(data, dict):
         raise EdunetApiError(f"상세 응답 형식이 예상과 다릅니다. pstId={pst_id}")
-    return data
-
-
-def _as_text(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    return "" if data.get("pstCn") is None else str(data["pstCn"])
 
 
 class _BodyTextParser(HTMLParser):
-    """Convert detail-body markup into readable text while preserving field boundaries."""
+    """Convert detail-body markup into text while preserving field boundaries."""
 
     _BLOCK_TAGS = {"address", "article", "blockquote", "br", "div", "li", "p", "section", "tr"}
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
+        self._ignored_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style"}:
+            self._ignored_tags.append(tag)
+            return
+        if self._ignored_tags:
+            return
         if tag in self._BLOCK_TAGS:
             self.parts.append("\n")
         elif tag in {"td", "th"}:
             self.parts.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style"}:
+            if tag in self._ignored_tags:
+                self._ignored_tags.reverse()
+                self._ignored_tags.remove(tag)
+                self._ignored_tags.reverse()
+            return
+        if self._ignored_tags:
+            return
         if tag in self._BLOCK_TAGS:
             self.parts.append("\n")
         elif tag in {"td", "th"}:
             self.parts.append(" ")
 
     def handle_data(self, data: str) -> None:
-        self.parts.append(data)
+        if not self._ignored_tags:
+            self.parts.append(data)
 
 
 def _plain_body_text(content: Any) -> str:
@@ -229,12 +216,12 @@ def _plain_body_text(content: Any) -> str:
 
 
 def _extract_course_group(content: Any) -> str:
-    """Read the value following ‘교과(군):’ from a subject's detail body."""
+    """Extract only the value of item 1, ‘교과(군):’, from the detail body."""
     text = _plain_body_text(content)
     if not text:
         return ""
 
-    label = re.search(r"(?:\b1\s*[.)]\s*)?교과\s*\(\s*군\s*\)\s*[:：]\s*", text)
+    label = re.search(r"(?:\b1\s*[.)]\s*|①\s*)?교과\s*\(\s*군\s*\)\s*[:：]\s*", text)
     if not label:
         return ""
 
@@ -242,22 +229,13 @@ def _extract_course_group(content: Any) -> str:
     if not value_tail:
         return ""
 
+    # Stop before item 2/3 (or another numbered field), even if the body is one line.
     next_field = re.search(
-        r"(?:\s*)(?:2\s*[.)]\s*)?(?:승인\s*허용\s*학교\s*유형|권장\s*이수\s*학점)\s*[:：]",
+        r"\s*(?=(?:[2-9]\s*[.)]\s*|[②-⑨]\s*)|(?:승인\s*허용\s*학교\s*유형|권장\s*이수\s*학점)\s*[:：])",
         value_tail,
     )
     value = value_tail[:next_field.start()] if next_field else value_tail.splitlines()[0]
     return re.sub(r"\s+", " ", value).strip(" \t\r\n:：")
-
-
-def _date_only(value: Any) -> str:
-    text = _as_text(value)
-    return text[:10] if len(text) >= 10 else text
-
-
-def _label(code: Any, mapping: dict[str, str]) -> str:
-    value = _as_text(code)
-    return mapping.get(value, value)
 
 
 def crawl_2022_subjects(
@@ -269,11 +247,11 @@ def crawl_2022_subjects(
     interval_seconds: float = 0.5,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> CrawlSummary:
-    """Collect 2022 list rows and visit each selected subject's detail endpoint for textbook name.
+    """Collect only subject names and item 1's ‘교과(군)’ value from 2022 details.
 
-    Site pages are 15 rows each. The API accepted up to 100 rows per request in the
-    observed session, so the default reduces list calls while preserving every row.
-    Detail calls remain one per subject because textbook names are absent from list results.
+    The subject name is retained as the row key. The crawler discards other list
+    metadata, only reads `pstCn` from each detail response, and never falls back to
+    `relSbj` or collects the textbook/school/status/date fields.
     """
     page_size = max(1, min(int(page_size), 100))
     workers = max(1, min(int(workers), 5))
@@ -283,7 +261,7 @@ def crawl_2022_subjects(
     first = _list_page(1, page_size, 0, limiter)
     paging = first.get("pagingProperty") or {}
     total_items = int(paging.get("countItem") or 0)
-    total_api_pages = int(paging.get("countPage") or math.ceil(total_items / page_size) if total_items else 0)
+    total_api_pages = int(paging.get("countPage") or (math.ceil(total_items / page_size) if total_items else 0))
     total_site_pages = math.ceil(total_items / 15) if total_items else 0
     if total_api_pages <= 0:
         return CrawlSummary([], [], 0, 0, 0, start_page, start_page)
@@ -299,8 +277,6 @@ def crawl_2022_subjects(
         page_data.extend(data.get("dataList", []))
         api_pages_used += 1
 
-    # Read the official code labels once, after the list request, to avoid stale hard-coded names.
-    codes = fetch_code_maps(limiter)
     items = [(index, item) for index, item in enumerate(page_data)]
     results: dict[int, dict[str, str]] = {}
     errors: list[str] = []
@@ -308,31 +284,19 @@ def crawl_2022_subjects(
     def fetch_one(index: int, item: dict[str, Any]) -> tuple[int, dict[str, str], str | None]:
         pst_id = item.get("pstId")
         try:
-            detail = _detail(pst_id, limiter)
-            row = {
-                "과목명": _as_text(detail.get("pstTtl") or item.get("pstTtl")),
-                "관련교과(교과군)": (
-                    _extract_course_group(detail.get("pstCn"))
-                    or _as_text(detail.get("relSbj") or item.get("relSbj"))
-                ),
-                "학교급": _label(detail.get("pstSchlLvlCd") or item.get("pstSchlLvlCd"), codes.get("SLV_CD", {})),
-                "소속(기관)": _label(detail.get("pstSchlTypeCd") or item.get("pstSchlTypeCd"), codes.get("LOC_CD", {})),
-                "교과서명": _as_text(detail.get("pstTxbNm")),
-                "상태": _label(detail.get("aprvYnCd") or item.get("aprvYnCd"), codes.get("APRV_CD", {})),
-                "작성일": _date_only(detail.get("regDt") or item.get("regDt")),
-            }
-            return index, row, None
-        except Exception as exc:  # Keep list fields even if one detail request fails.
-            row = {
-                "과목명": _as_text(item.get("pstTtl")),
-                "관련교과(교과군)": _as_text(item.get("relSbj")),
-                "학교급": _label(item.get("pstSchlLvlCd"), codes.get("SLV_CD", {})),
-                "소속(기관)": _label(item.get("pstSchlTypeCd"), codes.get("LOC_CD", {})),
-                "교과서명": "",
-                "상태": _label(item.get("aprvYnCd"), codes.get("APRV_CD", {})),
-                "작성일": _date_only(item.get("regDt")),
-            }
-            return index, row, f"pstId={pst_id}: {exc}"
+            body = _detail_body(pst_id, limiter)
+            value = _extract_course_group(body)
+            error = None
+        except Exception as exc:
+            value = ""
+            error = f"pstId={pst_id}: {exc}"
+
+        # Blank means the target label was absent/empty or detail retrieval failed.
+        row = {
+            "과목명": "" if item.get("pstTtl") is None else str(item.get("pstTtl")).strip(),
+            "관련교과(교과군)": value,
+        }
+        return index, row, error
 
     completed = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
