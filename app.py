@@ -67,8 +67,20 @@ def run_crawler():
         progress_bar.progress(int((page_num / max_pages) * 100))
         page_num += 1
         
-        # 다음 페이지로 이동하는 자바스크립트 강제 실행 (가장 안정적)
-        driver.execute_script(f"fn_goPage({page_num});")
+        if page_num > max_pages:
+            break
+            
+        try:
+            # <a> 태그의 텍스트가 해당 페이지 번호와 일치하는 요소를 찾음
+            next_page_btn = driver.find_element(By.XPATH, f"//a[normalize-space()='{page_num}']")
+            
+            # .click() 사용 시 화면 가림막(팝업 등)에 막히는 것을 방지하기 위해 자바스크립트로 요소 직접 클릭
+            driver.execute_script("arguments[0].click();", next_page_btn)
+            
+        except Exception as e:
+            # 마지막 페이지이거나 다음 페이지 버튼을 찾을 수 없는 경우 무한 루프 방지
+            st.info(f"더 이상 이동할 페이지가 없습니다. (현재 수집 완료: {page_num-1}페이지)")
+            break
         
     driver.quit()
     status_text.success("데이터 수집이 완료되었습니다!")
