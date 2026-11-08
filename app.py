@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import math
 
 import pandas as pd
 import streamlit as st
@@ -15,7 +14,7 @@ st.set_page_config(
 )
 
 st.title("에듀넷 교육감 승인과목 수집기")
-st.caption("2022 개정 교육과정의 과목 목록과 상세 화면의 교과(군)·교과서명을 모읍니다.")
+st.caption("2022 개정 교육과정 과목의 상세 본문에서 ‘1. 교과(군)’ 항목만 수집합니다.")
 
 st.info(
     "이 도구는 에듀넷 화면이 사용하는 읽기 전용 API를 조회합니다. "
@@ -24,9 +23,9 @@ st.info(
 )
 
 st.markdown(
-    "**수집 항목:** 과목명 · 관련교과(교과군) · 학교급 · 소속(기관) · 교과서명 · 상태 · 작성일  "
-    "\n\n관련교과(교과군)는 과목 상세 내용의 `교과(군):` 값을 우선 사용하고, 해당 내용이 없으면 기존 관련교과 값을 보조로 사용합니다. "
-    "교과서명도 상세 정보에서 가져오므로 과목별 상세 조회가 한 번씩 추가됩니다."
+    "**CSV 열:** `과목명`(행 식별용) · `관련교과(교과군)`(`1. 교과(군):`의 값)  "
+    "\n\n학교급·기관·교과서명·상태·작성일 및 2·3번 항목은 수집 결과에 포함하지 않습니다. "
+    "상세 본문에 `교과(군):`이 없으면 기존 관련교과 값으로 대체하지 않고 빈칸으로 둡니다."
 )
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -102,7 +101,7 @@ selected_records = min(
 estimated_minutes = selected_records * interval_seconds / 60
 st.warning(
     f"선택 범위에는 최대 약 {selected_records:,}건이 포함됩니다. "
-    f"교과서명 조회까지 요청 간격만으로 약 {estimated_minutes:.1f}분 이상 걸릴 수 있습니다. "
+    f"각 과목의 상세 본문 조회까지 요청 간격만으로 약 {estimated_minutes:.1f}분 이상 걸릴 수 있습니다. "
     "처음에는 1페이지로 시험한 뒤 전체 수집을 권장합니다."
 )
 
@@ -154,6 +153,11 @@ if st.session_state.get("crawl_rows"):
         f"API 목록 요청 {meta.get('api_pages_used', 0)}회 · "
         f"현재 전체 2022 자료 {meta.get('total_items', 0):,}건"
     )
+    found_count = int(frame["관련교과(교과군)"].fillna("").astype(str).str.strip().ne("").sum())
+    empty_count = len(frame) - found_count
+    count_col1, count_col2 = st.columns(2)
+    count_col1.metric("교과(군) 값 확인", f"{found_count:,}건")
+    count_col2.metric("항목 없음 또는 조회 실패", f"{empty_count:,}건")
     st.dataframe(frame, use_container_width=True, hide_index=True)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -166,7 +170,7 @@ if st.session_state.get("crawl_rows"):
         type="primary",
     )
     if errors:
-        st.warning(f"상세 조회 {len(errors):,}건이 실패했습니다. 해당 행은 목록 정보로 저장하고 교과서명은 빈칸으로 두었습니다.")
+        st.warning(f"상세 본문 조회 {len(errors):,}건이 실패했습니다. 과목명은 남기고 ‘관련교과(교과군)’은 빈칸으로 두었습니다.")
         with st.expander("상세 조회 실패 목록"):
             st.code("\n".join(errors[:200]))
             if len(errors) > 200:
@@ -178,10 +182,9 @@ with st.expander("수집 방식과 주의 사항"):
     st.markdown(
         """
 - 2022 교육과정 필터는 에듀넷 코드 `CRCLM01`을 사용합니다.
-- `관련교과(교과군)`은 과목 상세 본문에서 `교과(군):` 다음의 값을 추출합니다. 해당 항목이 없거나 본문이 비어 있으면 상세/목록의 기존 관련교과 값을 보조값으로 사용합니다.
-- 과목명·학교급·기관·상태·작성일은 목록/상세 응답을 결합하고, 교과서명과 상세 본문은 과목별 상세 조회에서 가져옵니다.
-- 식별용 게시물 ID, 작성자 이름, 조회수 등 요청하지 않은 항목은 결과 CSV에 넣지 않습니다.
-- 상세 조회 실패가 있으면 목록 자료는 남기되 교과서명은 비워 둡니다. 실패 목록을 확인하고 해당 페이지를 다시 실행할 수 있습니다.
+- CSV에는 행 식별용 `과목명`과 본문의 `1. 교과(군):`에서 추출한 값만 저장합니다. 다른 목록 메타데이터와 2·3번 본문 항목은 사용하지 않습니다.
+- 항목이 없거나 빈 본문이면 기존 목록의 `relSbj`로 대체하지 않고 빈칸으로 둡니다.
+- 상세 본문 조회 실패 행은 과목명만 남고 대상 항목은 빈칸입니다. 실패 목록을 확인하고 해당 페이지를 다시 실행할 수 있습니다.
 - 전체 실행 전 일부 페이지로 먼저 동작을 확인하고, 데이터 이용 및 재배포 시 에듀넷의 이용약관·저작권 정책을 확인하세요.
         """
     )
