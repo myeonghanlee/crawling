@@ -3,7 +3,10 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from html import unescape
+from html.parser import HTMLParser
 import math
+import re
 import threading
 import time
 from typing import Callable, Any
@@ -189,6 +192,64 @@ def _as_text(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+class _BodyTextParser(HTMLParser):
+    """Convert detail-body markup into readable text while preserving field boundaries."""
+
+    _BLOCK_TAGS = {"address", "article", "blockquote", "br", "div", "li", "p", "section", "tr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+        elif tag in {"td", "th"}:
+            self.parts.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._BLOCK_TAGS:
+            self.parts.append("\n")
+        elif tag in {"td", "th"}:
+            self.parts.append(" ")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _plain_body_text(content: Any) -> str:
+    if content is None:
+        return ""
+    parser = _BodyTextParser()
+    parser.feed(unescape(str(content)))
+    text = "".join(parser.parts).replace("\r", "")
+    text = re.sub(r"[\t\f\v ]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def _extract_course_group(content: Any) -> str:
+    """Read the value following ‘교과(군):’ from a subject's detail body."""
+    text = _plain_body_text(content)
+    if not text:
+        return ""
+
+    label = re.search(r"(?:\b1\s*[.)]\s*)?교과\s*\(\s*군\s*\)\s*[:：]\s*", text)
+    if not label:
+        return ""
+
+    value_tail = text[label.end():].lstrip(" \t\r\n")
+    if not value_tail:
+        return ""
+
+    next_field = re.search(
+        r"(?:\s*)(?:2\s*[.)]\s*)?(?:승인\s*허용\s*학교\s*유형|권장\s*이수\s*학점)\s*[:：]",
+        value_tail,
+    )
+    value = value_tail[:next_field.start()] if next_field else value_tail.splitlines()[0]
+    return re.sub(r"\s+", " ", value).strip(" \t\r\n:：")
+
+
 def _date_only(value: Any) -> str:
     text = _as_text(value)
     return text[:10] if len(text) >= 10 else text
@@ -250,7 +311,10 @@ def crawl_2022_subjects(
             detail = _detail(pst_id, limiter)
             row = {
                 "과목명": _as_text(detail.get("pstTtl") or item.get("pstTtl")),
-                "관련교과(교과군)": _as_text(detail.get("relSbj") or item.get("relSbj")),
+                "관련교과(교과군)": (
+                    _extract_course_group(detail.get("pstCn"))
+                    or _as_text(detail.get("relSbj") or item.get("relSbj"))
+                ),
                 "학교급": _label(detail.get("pstSchlLvlCd") or item.get("pstSchlLvlCd"), codes.get("SLV_CD", {})),
                 "소속(기관)": _label(detail.get("pstSchlTypeCd") or item.get("pstSchlTypeCd"), codes.get("LOC_CD", {})),
                 "교과서명": _as_text(detail.get("pstTxbNm")),
